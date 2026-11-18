@@ -4,6 +4,7 @@ package utils
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -11,10 +12,115 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+var (
+	processTokenLock         sync.Mutex
+	acquireTokenFileLockFunc = acquireTokenFileLock
+)
+
+// tokenFileMutexName returns a session-local named mutex identifier derived from
+// the canonical lowercase destination path.
+func tokenFileMutexName(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	norm := strings.ToLower(filepath.Clean(abs))
+	sum := sha256.Sum256([]byte(norm))
+	// "Local\" namespace ensures session-isolation for the current logon session.
+	return fmt.Sprintf(`Local\meshery-token-%x`, sum[:16]), nil
+}
+
+// acquireTokenFileLock acquires both a process-local lock and a cross-process Windows
+// named mutex scoped to the destination token file. The lock is held through the
+// entire critical section (creation, write, permission hardening, installation,
+// and failure cleanup).
+func acquireTokenFileLock(path string) (func(), error) {
+	processTokenLock.Lock()
+	acquiredProcessLock := true
+	defer func() {
+		if acquiredProcessLock {
+			processTokenLock.Unlock()
+		}
+	}()
+
+	mutexName, err := tokenFileMutexName(path)
+	if err != nil {
+		return nil, fmt.Errorf("generate token mutex name: %w", err)
+	}
+	namePtr, err := windows.UTF16PtrFromString(mutexName)
+	if err != nil {
+		return nil, fmt.Errorf("convert token mutex name: %w", err)
+	}
+
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return nil, fmt.Errorf("get current user SID: %w", err)
+	}
+
+	var pinner runtime.Pinner
+	pinner.Pin(user.User.Sid)
+	defer pinner.Unpin()
+
+	sid := user.User.Sid.String()
+	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P(A;;GA;;;" + sid + ")")
+	if err != nil {
+		return nil, fmt.Errorf("create token mutex security descriptor: %w", err)
+	}
+
+	sa := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: sd,
+	}
+
+	// Create or open the session-local named mutex with restricted security descriptor.
+	handle, err := windows.CreateMutex(&sa, false, namePtr)
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		return nil, fmt.Errorf("create token mutex: %w", err)
+	}
+
+	// Lock the calling OS thread because Windows named mutexes have thread affinity.
+	runtime.LockOSThread()
+	acquiredOSThread := true
+	defer func() {
+		if acquiredOSThread {
+			runtime.UnlockOSThread()
+			_ = windows.CloseHandle(handle)
+		}
+	}()
+
+	const timeoutMs = 15000 // 15 seconds timeout
+	event, err := windows.WaitForSingleObject(handle, timeoutMs)
+	if err != nil {
+		return nil, fmt.Errorf("wait for token mutex: %w", err)
+	}
+
+	const waitTimeout = 0x00000102
+	switch event {
+	case windows.WAIT_OBJECT_0, windows.WAIT_ABANDONED:
+		// Mutex ownership acquired. WAIT_ABANDONED handles a previous crashed holder safely.
+	case waitTimeout:
+		return nil, fmt.Errorf("timeout waiting for token file lock on %s", path)
+	default:
+		return nil, fmt.Errorf("unexpected event %#x waiting for token mutex on %s", event, path)
+	}
+
+	acquiredProcessLock = false
+	acquiredOSThread = false
+
+	unlock := func() {
+		_ = windows.ReleaseMutex(handle)
+		_ = windows.CloseHandle(handle)
+		runtime.UnlockOSThread()
+		processTokenLock.Unlock()
+	}
+	return unlock, nil
+}
 
 // createPrivateTokenFile creates a new file with a private DACL before any token is written.
 // Permission helpers return wrapped system errors for callers to add command context.
@@ -47,7 +153,19 @@ func createPrivateTokenFile(path string) (*os.File, error) {
 
 // writeTokenFile writes a newly created private file and atomically replaces
 // the destination. Existing handles retain access only to the old file.
+//
+// Source identity is strictly bound to the verified open handle f.Fd()
+// via handle-based atomic rename operations, eliminating path-replacement races.
+// Concurrent writers are synchronized across the entire critical section,
+// and failed writers clean up only their own temporary file, never deleting
+// the destination.
 func writeTokenFile(path string, data []byte) error {
+	unlock, err := acquireTokenFileLockFunc(path)
+	if err != nil {
+		return fmt.Errorf("acquire token file lock: %w", err)
+	}
+	defer unlock()
+
 	var random [16]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return fmt.Errorf("generate temporary token filename: %w", err)
@@ -57,67 +175,86 @@ func writeTokenFile(path string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("create private token file: %w", err)
 	}
-	moved := false
+	installed := false
 	defer func() {
 		_ = f.Close()
-		if !moved {
+		if !installed {
+			// Cleanup is strictly tied to the current operation's temporary file.
+			// Destination is never deleted on failure.
 			_ = os.Remove(tempPath)
 		}
 	}()
+
 	if err := restrictTokenFileToCurrentUser(f); err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
 		return err
 	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
 	toPath, err := tokenFileLongPath(path)
 	if err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
+
 	if err := replaceTokenFile(f, toPath); err != nil {
-		// Some filesystems reject the extended rename operation. The legacy
-		// rename still replaces the file object and fails closed if an open
-		// handle prevents replacement; it never writes into the old file.
-		if !errors.Is(err, windows.ERROR_INVALID_NAME) && !errors.Is(err, windows.ERROR_INVALID_PARAMETER) && !errors.Is(err, windows.ERROR_NOT_SUPPORTED) {
-			return fmt.Errorf("replace token file: %w", err)
-		}
-		if closeErr := f.Close(); closeErr != nil {
-			return closeErr
-		}
-		fromPath, pathErr := tokenFileLongPath(tempPath)
-		if pathErr != nil {
-			return pathErr
-		}
-		from, pathErr := windows.UTF16PtrFromString(fromPath)
-		if pathErr != nil {
-			return pathErr
-		}
-		to, pathErr := windows.UTF16PtrFromString(toPath)
-		if pathErr != nil {
-			return pathErr
-		}
-		if moveErr := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); moveErr != nil {
-			return fmt.Errorf("replace token file: extended rename: %v; fallback: %w", err, moveErr)
-		}
-		moved = true
-		return nil
+		return fmt.Errorf("replace token file: %w", err)
 	}
-	moved = true
+
+	installed = true
 	return f.Close()
 }
 
-// replaceTokenFile uses POSIX rename semantics so a destination with a
-// delete-sharing metadata handle can be replaced without reusing its object.
+var (
+	replaceTokenFileExFunc  = replaceTokenFileEx
+	replaceTokenFileStdFunc = replaceTokenFileStandard
+)
+
+// replaceTokenFile uses handle-based atomic rename operations to replace the
+// destination. The source file is never closed before replacement and its identity
+// is bound strictly to file.Fd().
 func replaceTokenFile(file *os.File, destination string) error {
 	name, err := windows.UTF16FromString(destination)
 	if err != nil {
 		return err
 	}
 	name = name[:len(name)-1]
-	type renameInfo struct {
+
+	// 1. Try FileRenameInfoEx (class 22) with POSIX rename semantics first.
+	// This replaces an existing destination even if a metadata handle is open with delete-sharing.
+	errEx := replaceTokenFileExFunc(file, name)
+	if errEx == nil {
+		return nil
+	}
+
+	// 2. If class 22 is unsupported by the filesystem or Windows version,
+	// fall back to standard handle-based rename (FileRenameInfo, class 3).
+	// This also operates on the open handle file.Fd(), preserving source identity.
+	if isUnsupportedRenameClassError(errEx) {
+		errStd := replaceTokenFileStdFunc(file, name)
+		if errStd == nil {
+			return nil
+		}
+		return fmt.Errorf("handle-based rename: extended: %v; standard: %w", errEx, errStd)
+	}
+
+	// For all other errors (such as ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION),
+	// fail closed immediately without weakening security.
+	return errEx
+}
+
+func isUnsupportedRenameClassError(err error) bool {
+	return errors.Is(err, windows.ERROR_INVALID_PARAMETER) ||
+		errors.Is(err, windows.ERROR_INVALID_FUNCTION) ||
+		errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
+		errors.Is(err, windows.ERROR_CALL_NOT_IMPLEMENTED)
+}
+
+func replaceTokenFileEx(file *os.File, name []uint16) error {
+	type renameInfoEx struct {
 		Flags          uint32
 		RootDirectory  windows.Handle
 		FileNameLength uint32
@@ -125,14 +262,31 @@ func replaceTokenFile(file *os.File, destination string) error {
 	}
 	const replaceIfExists = 0x1
 	const posixSemantics = 0x2
-	var info renameInfo
+	var info renameInfoEx
 	offset := int(unsafe.Offsetof(info.FileName))
 	buffer := make([]byte, offset+len(name)*2)
-	entry := (*renameInfo)(unsafe.Pointer(&buffer[0]))
+	entry := (*renameInfoEx)(unsafe.Pointer(&buffer[0]))
 	entry.Flags = replaceIfExists | posixSemantics
 	entry.FileNameLength = uint32(len(name) * 2)
 	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[offset])), len(name)), name)
 	return windows.SetFileInformationByHandle(windows.Handle(file.Fd()), windows.FileRenameInfoEx, &buffer[0], uint32(len(buffer)))
+}
+
+func replaceTokenFileStandard(file *os.File, name []uint16) error {
+	type renameInfoStd struct {
+		ReplaceIfExists bool
+		RootDirectory   windows.Handle
+		FileNameLength  uint32
+		FileName        [1]uint16
+	}
+	var info renameInfoStd
+	offset := int(unsafe.Offsetof(info.FileName))
+	buffer := make([]byte, offset+len(name)*2)
+	entry := (*renameInfoStd)(unsafe.Pointer(&buffer[0]))
+	entry.ReplaceIfExists = true
+	entry.FileNameLength = uint32(len(name) * 2)
+	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[offset])), len(name)), name)
+	return windows.SetFileInformationByHandle(windows.Handle(file.Fd()), windows.FileRenameInfo, &buffer[0], uint32(len(buffer)))
 }
 
 func tokenFileLongPath(path string) (string, error) {
@@ -162,6 +316,10 @@ func restrictTokenFileToCurrentUser(file *os.File) error {
 	if err := verifyTokenFileOwner(file, user.User.Sid); err != nil {
 		return err
 	}
+
+	var pinner runtime.Pinner
+	pinner.Pin(user.User.Sid)
+	defer pinner.Unpin()
 
 	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
 		AccessPermissions: windows.GENERIC_ALL,
